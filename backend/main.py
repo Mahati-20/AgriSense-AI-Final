@@ -156,7 +156,13 @@ def request_gemini_json(url: str, headers: Dict[str, str], data: bytes) -> Any:
 app = FastAPI(title="AgriSense AI API", version="1.0.0")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    
+allow_origins=[
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+    "https://agrisense-ai-frontend-x9of.onrender.com",
+],
+,
     # Vite automatically moves to the next port when 5173 is occupied.
     # Keep the development exception limited to loopback hostnames.
     allow_origin_regex=r"^http://(?:localhost|127\.0\.0\.1)(?::\d+)?$",
