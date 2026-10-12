@@ -162,7 +162,7 @@ allow_origins=[
     "http://127.0.0.1:5173",
     "https://agrisense-ai-frontend-x9of.onrender.com",
 ],
-,
+
     # Vite automatically moves to the next port when 5173 is occupied.
     # Keep the development exception limited to loopback hostnames.
     allow_origin_regex=r"^http://(?:localhost|127\.0\.0\.1)(?::\d+)?$",
