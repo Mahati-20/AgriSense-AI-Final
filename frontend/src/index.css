@@ -232,6 +232,12 @@ select {
   gap: 18px;
 }
 
+.grid-4 {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 18px;
+}
+
 .metric-card {
   padding: 18px;
 }
@@ -1077,7 +1083,8 @@ body {
 .news-eyebrow { color: var(--agri-gold); }
 
 .grid-2,
-.grid-3 { gap: 22px; }
+.grid-3,
+.grid-4 { gap: 22px; }
 .dashboard-primary-grid {
   grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
   align-items: stretch;
@@ -1326,6 +1333,10 @@ body {
   .dashboard-alerts-card .notification-list { max-height: none; }
   .content-panel { padding: 12px; }
   .grid-2, .grid-3 { grid-template-columns: minmax(0, 1fr); }
+  .dashboard-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+
+@media (max-width: 1100px) {
   .dashboard-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
 

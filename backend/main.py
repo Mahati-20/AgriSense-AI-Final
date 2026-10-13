@@ -10,6 +10,7 @@ import urllib.request
 import time
 import logging
 import socket
+import ssl
 import math
 import mimetypes
 import uuid
@@ -27,8 +28,21 @@ from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Query, Heade
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, field_validator
 
-DB_PATH = os.path.join(os.path.dirname(__file__), "agrisense.db")
+if __package__:
+    from .local_agri_assistant import answer_question as answer_local_agri_question
+else:
+    from local_agri_assistant import answer_question as answer_local_agri_question
+
+DB_PATH = os.getenv("AGRISENSE_DB_PATH", os.path.join(os.path.dirname(__file__), "agrisense.db"))
 ENV_PATH = os.path.join(os.path.dirname(__file__), "..", ".env")
+_PRODUCTION = os.getenv("APP_ENV", "development").strip().lower() == "production"
+_CORS_ALLOWED_ORIGINS = [
+    origin.strip().rstrip("/")
+    for origin in os.getenv("CORS_ALLOWED_ORIGINS", "").split(",")
+    if origin.strip()
+]
+if not _PRODUCTION and not _CORS_ALLOWED_ORIGINS:
+    _CORS_ALLOWED_ORIGINS = ["http://localhost:5173", "http://127.0.0.1:5173"]
 logger = logging.getLogger("agrisense.assistant")
 _gnews_lock = threading.Lock()
 _gnews_cache: OrderedDict[str, tuple[float, List[Dict[str, Any]]]] = OrderedDict()
@@ -98,9 +112,15 @@ def safe_external_error(error: Exception, service: str = "External service") -> 
     reason = error.reason if isinstance(error, urllib.error.URLError) else error
     if isinstance(reason, (TimeoutError, asyncio.TimeoutError, socket.timeout)):
         return "request timed out; retry shortly"
+    if isinstance(reason, ssl.SSLCertVerificationError):
+        return f"{service} TLS certificate verification failed; check the system certificate store and authorized network settings"
+    if isinstance(reason, ssl.SSLError):
+        return f"secure TLS connection to {service} failed; check the system certificate store and network settings"
     if isinstance(reason, socket.gaierror):
         return f"{service} hostname could not be resolved; check DNS connectivity"
-    if isinstance(reason, (ConnectionRefusedError, ConnectionResetError, ConnectionAbortedError)):
+    if isinstance(reason, ConnectionRefusedError):
+        return f"connection to {service} was refused; check outbound firewall rules and provider availability"
+    if isinstance(reason, (ConnectionResetError, ConnectionAbortedError)):
         return f"could not connect to {service}; check network or firewall settings"
     if isinstance(error, json.JSONDecodeError):
         return f"{service} returned invalid JSON; retry shortly"
@@ -109,15 +129,67 @@ def safe_external_error(error: Exception, service: str = "External service") -> 
     return "network connection failed; check connectivity and retry"
 
 
+def gemini_http_error(error: urllib.error.HTTPError, api_key: str) -> tuple[int, str]:
+    """Map Google's structured error to a useful, secret-safe API error."""
+    status = error.code
+    provider_code = ""
+    provider_status = ""
+    provider_message = ""
+    try:
+        payload = json.loads(error.read().decode("utf-8"))
+        details = payload.get("error", {}) if isinstance(payload, dict) else {}
+        if isinstance(details, dict):
+            provider_code = str(details.get("code", ""))[:24]
+            provider_status = str(details.get("status", ""))[:48]
+            provider_message = str(details.get("message", ""))[:240]
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, AttributeError):
+        pass
+
+    safe_message = provider_message
+    if api_key:
+        safe_message = safe_message.replace(api_key, "[redacted]")
+    safe_message = re.sub(r"AIza[0-9A-Za-z_-]{20,}", "[redacted]", safe_message)
+    safe_message = re.sub(r"(?i)(key|token|authorization)\s*[:=]\s*[^\s,;]+", r"\1=[redacted]", safe_message)
+    safe_message = " ".join(safe_message.split())[:200]
+
+    lowered = f"{provider_status} {safe_message}".lower()
+    provider_hint = f"provider {provider_status}" if provider_status else "provider error"
+    provider_code_hint = f", code {provider_code}" if provider_code else ""
+    if status in (400, 401) and any(term in lowered for term in ("api key not valid", "api_key_invalid", "invalid api key")):
+        message = "Gemini rejected the configured API key. Verify GEMINI_API_KEY and that the key is active."
+        status = 502
+    elif status == 403 or any(term in lowered for term in ("permission_denied", "billing", "api has not been used", "access denied")):
+        message = "Gemini denied access. Check API enablement, key permissions, billing, and project restrictions."
+        status = 502
+    elif status == 404:
+        message = f"Gemini model or endpoint was not found (HTTP 404). Verify GEMINI_MODEL ({provider_hint}{provider_code_hint})."
+        status = 502
+    elif status == 429:
+        message = f"Gemini rate limited the request or quota is exhausted (HTTP 429). Check quota and retry later ({provider_hint}{provider_code_hint})."
+    elif status == 503:
+        message = f"Gemini is temporarily unavailable (HTTP 503; {provider_hint}{provider_code_hint}). Retry later."
+    elif status >= 500:
+        message = f"Gemini is temporarily unavailable (HTTP {status}; {provider_hint}{provider_code_hint}). Retry later."
+        status = 503
+    else:
+        message = f"Gemini rejected the request (HTTP {status}; {provider_hint}{provider_code_hint}). Verify model and request settings."
+
+    if safe_message and safe_message.lower() not in message.lower():
+        message = f"{message} Provider message: {safe_message}"
+    return status, message
+
+
 def get_gemini_model() -> str:
     configured_model = get_secret("GEMINI_MODEL")
+    if not configured_model:
+        return "gemini-3.8-flash"
     if (
         configured_model.startswith("gemini-")
         and len(configured_model) <= 80
         and all(character.isalnum() or character in "._-" for character in configured_model)
     ):
         return configured_model
-    return "gemini-3.8-flash"
+    raise ValueError("GEMINI_MODEL has invalid formatting. Use a supported Gemini model ID.")
 
 
 def request_gemini_json(url: str, headers: Dict[str, str], data: bytes) -> Any:
@@ -156,19 +228,11 @@ def request_gemini_json(url: str, headers: Dict[str, str], data: bytes) -> Any:
 app = FastAPI(title="AgriSense AI API", version="1.0.0")
 app.add_middleware(
     CORSMiddleware,
-    
-allow_origins=[
-    "http://localhost:5173",
-    "http://127.0.0.1:5173",
-    "https://agrisense-ai-frontend-x9of.onrender.com",
-],
-
-    # Vite automatically moves to the next port when 5173 is occupied.
-    # Keep the development exception limited to loopback hostnames.
-    allow_origin_regex=r"^http://(?:localhost|127\.0\.0\.1)(?::\d+)?$",
+    allow_origins=_CORS_ALLOWED_ORIGINS,
+    allow_origin_regex=None if _PRODUCTION else r"^http://(?:localhost|127\.0\.0\.1)(?::\d+)?$",
     allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "PUT", "DELETE"],
+    allow_headers=["Authorization", "Content-Type"],
 )
 
 
@@ -596,6 +660,16 @@ def init_db() -> None:
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS notification_read_receipt (
+                user_id INTEGER NOT NULL REFERENCES app_user(id) ON DELETE CASCADE,
+                notification_id INTEGER NOT NULL REFERENCES notification(id) ON DELETE CASCADE,
+                read_at TEXT NOT NULL,
+                PRIMARY KEY (user_id, notification_id)
+            )
+            """
+        )
         conn.execute("""
             CREATE TABLE IF NOT EXISTS farm_tool_record (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -759,7 +833,28 @@ def score_to_decision(payload: DecisionRequest) -> Dict[str, Any]:
     }
 
 
-async def build_dashboard_payload() -> Dict[str, Any]:
+def notifications_for_user(user_id: int | None = None) -> List[Dict[str, Any]]:
+    notifications = fetch_all("SELECT * FROM notification ORDER BY id DESC LIMIT 5")
+    read_ids = set()
+    if user_id is not None:
+        read_ids = {
+            row["notification_id"]
+            for row in fetch_all(
+                "SELECT notification_id FROM notification_read_receipt WHERE user_id = ?",
+                (user_id,),
+            )
+        }
+    return [
+        {
+            **item,
+            "read": bool(item.get("read")) or item["id"] in read_ids,
+            "data_source": "DEMO DATA",
+        }
+        for item in notifications
+    ]
+
+
+async def build_dashboard_payload(user_id: int | None = None) -> Dict[str, Any]:
     farmer = {**fetch_all("SELECT * FROM farmer LIMIT 1")[0], "data_source": "DEMO DATA"}
     crop = {**fetch_all("SELECT * FROM crop WHERE name = 'Tomato' LIMIT 1")[0], "data_source": "DEMO DATA"}
     weather = await get_weather()
@@ -769,7 +864,16 @@ async def build_dashboard_payload() -> Dict[str, Any]:
     except HTTPException as error:
         market = []
         market_error = error.detail
-    notifications = [{**item, "data_source": "DEMO DATA"} for item in fetch_all("SELECT * FROM notification ORDER BY id DESC LIMIT 5")]
+    notifications = notifications_for_user(user_id)
+    farmer_summary = None
+    if user_id is not None:
+        farmer_crops = _farm_tool_rows(user_id, "planner-crops")
+        farmer_tasks = _farm_tool_rows(user_id, "planner-tasks")
+        farmer_summary = {
+            "crop_count": len(farmer_crops),
+            "open_task_count": sum(1 for item in farmer_tasks if item.get("status") != "Completed"),
+            "data_source": "USER ENTERED",
+        }
     tasks = [{**item, "completed": bool(item["completed"]), "data_source": item.get("data_source", "DEMO DATA")} for item in fetch_all("SELECT * FROM farming_task WHERE completed = 0 ORDER BY date LIMIT 4")]
     try:
         trend = await get_market_trend_data("Tomato", "Karnataka", "", "")
@@ -822,6 +926,7 @@ async def build_dashboard_payload() -> Dict[str, Any]:
     return {
         "farmer": farmer,
         "crop": crop,
+        "farmer_summary": farmer_summary,
         "weather": weather,
         "market": market,
         "market_error": market_error,
@@ -986,8 +1091,9 @@ def logout(authorization: str | None = Header(default=None)) -> Dict[str, str]:
 
 
 @app.get("/api/dashboard")
-async def dashboard() -> Dict[str, Any]:
-    return await build_dashboard_payload()
+async def dashboard(authorization: str | None = Header(default=None)) -> Dict[str, Any]:
+    user = _authenticated_user(authorization) if authorization else None
+    return await build_dashboard_payload(user["id"] if user else None)
 
 
 async def build_plantnet_multipart(images: List[UploadFile], organs: List[str]) -> tuple[str, bytes]:
@@ -1333,20 +1439,17 @@ async def get_market_trend_data(commodity: str = "Tomato", state: str = "Karnata
     records = [row for row in result.get("records", []) if isinstance(row, dict)]
     by_date: Dict[str, List[float]] = {}
     parsed_dates: Dict[str, datetime] = {}
-    all_units_confirmed = bool(records)
     for row in records:
         raw_date, raw_price = row.get("arrival_date"), row.get("modal_price")
         if not raw_date or raw_price is None:
-            all_units_confirmed = False
             continue
         normalized = normalize_mandi_record(row)
-        source_price = normalized["price"] if normalized["price_compatible"] else raw_price
         if not normalized["price_compatible"]:
-            all_units_confirmed = False
+            continue
+        source_price = normalized["price"]
         try:
             observed_price = float(source_price)
         except (TypeError, ValueError):
-            all_units_confirmed = False
             continue
         parsed = None
         for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y"):
@@ -1359,17 +1462,17 @@ async def get_market_trend_data(commodity: str = "Tomato", state: str = "Karnata
             continue
         by_date.setdefault(parsed.date().isoformat(), []).append(observed_price)
         parsed_dates[parsed.date().isoformat()] = parsed
-    unit = "₹/kg" if all_units_confirmed else None
+    unit = "₹/kg" if by_date else None
     observations = [{"date": key, "price": round(sum(values) / len(values), 2), "unit": unit, "market_count": len(values)} for key, values in by_date.items()]
     observations.sort(key=lambda item: parsed_dates[item["date"]])
     history = observations[-7:]
     prices = [item["price"] for item in history]
     if len(history) < 7:
-        return {"data_source": result.get("data_source"), "observations": history, "trend_available": False, "forecast_available": False, "price_unit": unit, "message": "At least seven valid dated observations are needed for a trend estimate."}
+        return {"data_source": result.get("data_source"), "observations": history, "trend_available": False, "forecast_available": False, "price_unit": unit, "freshness": result.get("freshness", "unknown"), "freshness_message": result.get("freshness_message"), "message": "At least seven valid dated observations with a confirmed compatible unit are needed for a trend estimate."}
     average = sum(prices) / len(prices)
     change = ((prices[-1] - prices[0]) / prices[0] * 100) if prices[0] else 0
     forecast = max(0, average * (1 + change / 100))
-    return {"data_source": result["data_source"], "observations": history, "average_7": round(average, 2), "trend_percent": round(change, 2), "trend_direction": "up" if change > 1 else "down" if change < -1 else "stable", "minimum": min(prices), "maximum": max(prices), "trend_available": True, "forecast_available": True, "price_unit": unit, "forecast_method": "Illustrative estimate from seven dated provider observations; not a mandi quote", "forecast_range": {"lower": round(forecast * 0.9, 2), "upper": round(forecast * 1.1, 2)}}
+    return {"data_source": result["data_source"], "observations": history, "average_7": round(average, 2), "trend_percent": round(change, 2), "trend_direction": "up" if change > 1 else "down" if change < -1 else "stable", "minimum": min(prices), "maximum": max(prices), "trend_available": True, "forecast_available": True, "price_unit": unit, "freshness": result.get("freshness", "unknown"), "freshness_message": result.get("freshness_message"), "forecast_method": "Illustrative estimate from seven dated provider observations; not a mandi quote or guaranteed future price", "forecast_range": {"lower": round(forecast * 0.9, 2), "upper": round(forecast * 1.1, 2)}}
 
 @app.get("/api/markets/trend")
 async def market_trend(commodity: str = "Tomato", state: str = "Karnataka", district: str = "", market: str = "") -> Dict[str, Any]:
@@ -1679,188 +1782,67 @@ async def get_news(
 
 
 @app.post("/api/assistant")
-async def ask_assistant(payload: AssistantRequest) -> Dict[str, Any]:
+async def ask_assistant(
+    payload: AssistantRequest,
+    authorization: str | None = Header(default=None),
+) -> Dict[str, Any]:
+    """Answer locally; optional bearer auth scopes farm records to one account."""
     decision = score_to_decision(DecisionRequest(crop=payload.crop, location=payload.location))
-    key = get_secret("GEMINI_API_KEY")
-    async def safe_market_context() -> Dict[str, Any]:
-        try:
-            return {"records": await get_market_rows(payload.crop, "Karnataka"), "error": None}
-        except HTTPException as error:
-            return {"records": [], "error": error.detail}
-
-    weather, market_result = await asyncio.gather(get_weather(), safe_market_context())
-    market = market_result["records"]
-    context = {
-        "farm_record": [
-            {key: value for key, value in row.items() if key not in {"id", "name"}}
-            for row in fetch_all("SELECT * FROM farmer LIMIT 1")
-        ],
-        "crop": fetch_all("SELECT * FROM crop WHERE name = ? LIMIT 1", (payload.crop,)),
-        "weather": weather,
-        "market": market,
-        "market_data_status": "unavailable" if market_result["error"] else "available" if market else "no matching records",
-        "market_error": market_result["error"],
-        "storage": [{**item, "data_source": "DEMO DATA"} for item in fetch_all("SELECT * FROM storage ORDER BY distance LIMIT 5")],
-        "decision": decision,
-    }
-    if not key:
-        return {"answer": "AgriSense AI assistant is unavailable because GEMINI_API_KEY is not configured. Current market and weather information may be demo data; no live recommendation or diagnosis is being generated.", "recommendation": decision["recommendation"], "confidence": decision["confidence"], "reasons": decision["reasons"], "data_source": "DEMO CONTEXT; AI unavailable", "status": "unavailable"}
-
-    prompt = f"""
-You are AgriSense AI, a helpful agricultural assistant for farmers.
-
-LANGUAGE AND COMMUNICATION:
-- Respond in the language specified by this language code: {payload.language}.
-- Use simple, clear, respectful, farmer-friendly language.
-- Explain technical terms briefly.
-- Be practical, accurate, and concise.
-- Answer the farmer's actual question first.
-- Avoid unnecessary introductions and unrelated information.
-
-FARM AND CROP CONTEXT:
-- Crop: {payload.crop}
-- Location: {payload.location}
-- Use the supplied context to understand the farmer's records, crop stage,
-  weather, market information, storage options, and existing recommendation.
-- Do not assume that every record is complete, current, or verified.
-- Do not invent missing farm information.
-
-GENERAL FARMING GUIDANCE:
-- For questions about crop growth, irrigation, soil health, nutrients,
-  pests, diseases, flowering, fruit development, and harvesting, provide
-  useful guidance based on established general agricultural knowledge,
-  even when the supplied context contains no farming instructions.
-- Do not refuse to answer a general farming question simply because
-  the farm records do not contain the answer.
-- Clearly distinguish general agricultural guidance from information
-  retrieved from the supplied farm records.
-- Tailor guidance to the specified crop, location, and growth stage
-  when those details are available.
-- If the growth stage is unknown, do not assume one.
-- For crop-growing questions, provide 3 to 5 practical steps where
-  appropriate, explaining what to do and why.
-- Explain what the farmer should monitor and what signs may indicate
-  that further investigation is needed.
-- If important details are missing, provide safe general guidance
-  where possible and ask one relevant follow-up question.
-- Consider soil type, crop variety, irrigation method, climate,
-  and growth stage when these materially affect the recommendation.
-- Never invent crop symptoms, soil test results, farm measurements,
-  diagnoses, yield estimates, or field conditions.
-- Treat possible pest or disease causes as possibilities, not confirmed
-  diagnoses, unless sufficient evidence supports a diagnosis.
-- Give precise fertilizer doses, pesticide dosages, chemical treatments,
-  and irrigation schedules only when sufficient information supports
-  a safe and appropriate recommendation.
-- If a precise recommendation cannot be made safely, explain what
-  additional information is required.
-- Do not claim that general agricultural knowledge came from farm
-  records, laboratory tests, live weather data, or local authorities.
-
-WEATHER INFORMATION:
-- Use supplied weather information for current weather claims.
-- Identify its source and date when available.
-- Do not invent weather measurements or forecasts.
-- If weather information is missing, say that current conditions
-  have not been verified rather than making up values.
-
-MARKET AND STORAGE INFORMATION:
-- Use the supplied context for market prices and storage information.
-- Clearly identify all records marked DEMO DATA as illustrative,
-  not live or verified information.
-- Never present demo prices, storage facilities, or rates as confirmed
-  current offers.
-- Do not invent prices, market trends, transport costs, storage costs,
-  production costs, or profit estimates.
-- If verified information is missing, explain the limitation clearly.
-
-DETERMINISTIC SELL/STORE RECOMMENDATION:
-- Explain the recommendation provided in the supplied decision context.
-- Preserve the supplied recommendation, confidence, score, and reasons.
-- Do not independently change the deterministic recommendation.
-- If the recommendation is WAIT because information is insufficient,
-  explain which inputs are missing.
-- Clarify that WAIT due to missing information is not a prediction
-  that prices will rise or a recommendation to delay selling.
-- Do not promise profits or present unsupported financial claims.
-- Keep crop-care advice separate from commercial sell/store decisions.
-
-RESPONSE STRUCTURE:
-- Start with a direct answer to the farmer's question.
-- Use short headings and bullet points when helpful.
-- For farming questions, explain practical actions, monitoring,
-  relevant limitations, and any necessary follow-up question.
-- For market questions, distinguish verified information from demo data
-  and explain any uncertainty.
-- Include weather, market, or storage details only when relevant.
-- Avoid repeating the entire supplied context unnecessarily.
-- Do not claim to have performed an action or checked a source
-  that was not actually used.
-
-SUPPLIED AGRISENSE CONTEXT:
-{json.dumps(context, ensure_ascii=False, default=str)}
-
-FARMER'S QUESTION:
-{payload.message}
-
-Provide a helpful, direct, evidence-aware answer in the requested
-language. Never invent missing facts.
-"""
-
-    endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/{get_gemini_model()}:generateContent"
-
-    try:
-        data = await asyncio.to_thread(
-            request_gemini_json,
-            endpoint,
-            {"Content-Type": "application/json", "x-goog-api-key": key},
-            json.dumps({
-                "contents": [{"parts": [{"text": prompt}]}],
-                "generationConfig": {
-                    "thinkingConfig": {"thinkingLevel": "low"},
-                    "maxOutputTokens": 768,
-                },
-            }).encode(),
+    farm_records: List[Dict[str, Any]] = []
+    if authorization:
+        user = _authenticated_user(authorization)
+        rows = fetch_all(
+            "SELECT kind, payload, created_at, updated_at FROM farm_tool_record "
+            "WHERE user_id = ? ORDER BY created_at DESC, id DESC LIMIT 100",
+            (user["id"],),
         )
-        answer = data["candidates"][0]["content"]["parts"][0]["text"].strip()
-        if not answer:
-            raise ValueError("empty Gemini response")
-        source = "Gemini; supplied AgriSense context"
-    except urllib.error.HTTPError as error:
-        status = 503 if error.code >= 500 else 429 if error.code == 429 else 401 if error.code in (401, 403) else 502
-        message = safe_external_error(error, "Gemini")
-        logger.warning("Gemini request failed: %s", message)
-        error.close()
-        raise HTTPException(status_code=status, detail=message) from error
-    except (json.JSONDecodeError, KeyError, IndexError, TypeError, ValueError) as error:
-        message = safe_external_error(error, "Gemini")
-        logger.warning("Gemini response was invalid: %s", message)
-        raise HTTPException(status_code=502, detail=message) from error
-    except Exception as error:
-        timeout_failure = isinstance(error, (TimeoutError, asyncio.TimeoutError)) or (
-            isinstance(error, urllib.error.URLError) and isinstance(error.reason, TimeoutError)
+        for row in rows:
+            try:
+                data = json.loads(row["payload"])
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if isinstance(data, dict):
+                farm_records.append({"kind": row["kind"], "data": data, "data_status": "USER ENTERED", "created_at": row["created_at"], "updated_at": row["updated_at"]})
+        tasks = fetch_all(
+            "SELECT title, crop, date, priority, completed FROM farming_task "
+            "WHERE user_id = ? ORDER BY date DESC, id DESC LIMIT 50",
+            (user["id"],),
         )
-        message = safe_external_error(error, "Gemini")
-        logger.warning("Gemini request failed: %s", message)
-        raise HTTPException(status_code=504 if timeout_failure else 502, detail=message) from error
+        farm_records.extend({"kind": "calendar-task", "data": row, "data_status": "USER ENTERED"} for row in tasks)
+
+    # The legacy shared crop table has no account owner. It is exposed only as
+    # shared example context, never represented as the authenticated user's data.
+    shared_crops = fetch_all(
+        "SELECT name, variety, planting_date, expected_harvest_date, current_stage, quantity FROM crop ORDER BY id"
+    )
+    local_result = answer_local_agri_question(
+        payload.message,
+        crop_hint=payload.crop,
+        farm_records=farm_records,
+        shared_crops=shared_crops,
+    )
     return {
-        "answer": answer,
+        "answer": local_result["answer"],
         "recommendation": decision["recommendation"],
         "confidence": decision["confidence"],
         "reasons": decision["reasons"],
-        "data_source": source,
+        "data_source": local_result["data_source"],
     }
 
 
 @app.get("/api/assistant/status")
 async def assistant_status() -> Dict[str, Any]:
-    configured = bool(get_secret("GEMINI_API_KEY"))
-    return {"available": configured, "configured": configured, "status": "configured" if configured else "unavailable", "model": get_gemini_model(), "data_source": "Key configured; connection is checked on request" if configured else "DEMO / AI UNAVAILABLE"}
-
+    return {
+        "available": True,
+        "status": "local",
+        "label": "LOCAL AGRICULTURE ASSISTANT",
+        "data_source": "Local agriculture knowledge and account-scoped farm records",
+    }
 
 @app.get("/api/notifications")
-async def get_notifications() -> List[Dict[str, Any]]:
-    return [{**item, "data_source": "DEMO DATA"} for item in fetch_all("SELECT * FROM notification ORDER BY id DESC")]
+async def get_notifications(authorization: str | None = Header(default=None)) -> List[Dict[str, Any]]:
+    user = _authenticated_user(authorization) if authorization else None
+    return notifications_for_user(user["id"] if user else None)
 
 
 @app.get("/api/farm-tools/{kind}")
@@ -1910,11 +1892,20 @@ def delete_farm_tool_record(kind: str, record_id: int, authorization: str | None
 
 
 @app.put("/api/notifications/{notification_id}/read")
-async def mark_notification_read(notification_id: int) -> Dict[str, Any]:
+async def mark_notification_read(notification_id: int, authorization: str | None = Header(default=None)) -> Dict[str, Any]:
+    user = _authenticated_user(authorization)
     with closing(sqlite3.connect(DB_PATH)) as conn:
-        cursor = conn.execute("UPDATE notification SET read = 1 WHERE id = ?", (notification_id,))
-        if cursor.rowcount == 0:
+        notification = conn.execute("SELECT id FROM notification WHERE id = ?", (notification_id,)).fetchone()
+        if notification is None:
             raise HTTPException(status_code=404, detail="Notification not found")
+        conn.execute(
+            """
+            INSERT INTO notification_read_receipt (user_id, notification_id, read_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(user_id, notification_id) DO NOTHING
+            """,
+            (user["id"], notification_id, datetime.now(timezone.utc).isoformat()),
+        )
         conn.commit()
     return {"status": "read", "id": notification_id}
 

@@ -87,6 +87,28 @@ Run the backend regression tests from the repository root:
 
 If the assistant reports an invalid key, check that the root `.env` variable is named `GEMINI_API_KEY` and that the key is active. For HTTP 429, inspect the Google AI quota and wait before retrying. Timeouts and temporary 5xx errors are retried a limited number of times; retry later if they continue. The status endpoint only confirms configuration, not provider connectivity.
 
+## Deployment preparation (Vercel frontend + Render backend)
+
+The repository already contains Vercel SPA rewrites and a production `VITE_API_URL` example. Deploying remains a manual hosting-dashboard action; do not commit `.env` files.
+
+1. In Vercel, import the repository as a Vite project, set **Root Directory** to `frontend`, **Build Command** to `npm run build`, and **Output Directory** to `dist`. Add `VITE_API_URL=https://<your-render-service>.onrender.com` to Production and Preview as appropriate, then redeploy after changing it. It is a public frontend setting, so it must contain only the backend URL, never provider credentials.
+2. In Render, create a Python web service with **Root Directory** left at the repository root, **Build Command** `pip install -r backend/requirements.txt`, **Start Command** `uvicorn main:app --app-dir backend --host 0.0.0.0 --port $PORT`, and **Health Check Path** `/health`.
+3. Set Render variables: `APP_ENV=production`, `CORS_ALLOWED_ORIGINS=https://<exact-vercel-domain>` (comma-separate only explicitly used additional frontend origins), `AGRISENSE_DB_PATH=/var/data/agrisense.db`, and each server-side provider variable that is actually needed: `GEMINI_API_KEY`, `GEMINI_MODEL=gemini-3.8-flash`, `PLANTNET_API_KEY`, `GNEWS_API_KEY`, and optionally `MANDI_API_BASE_URL`. Never set provider credentials as `VITE_*` variables.
+4. For SQLite persistence on Render, attach a persistent disk to the **paid** backend web service at `/var/data`. Render's free web services do not support persistent disks; with free/ephemeral storage, farmer accounts and edits can disappear on restart or deploy. Keep this service single-instance. Back up the database before upgrades and periodically copy a consistent SQLite backup off the service; do not treat the disk as the only backup.
+5. Deploy the backend, verify `https://<your-render-service>.onrender.com/health`, then update the Vercel `VITE_API_URL` and redeploy. Confirm the browser origin matches `CORS_ALLOWED_ORIGINS` exactly and run signup/profile/calendar flows before inviting farmers.
+
+Local production checks (no live provider calls):
+
+```powershell
+.\.venv\Scripts\python.exe -m unittest backend.test_main
+cd frontend
+node --experimental-strip-types --test tests/assistantKeyboard.test.ts tests/assistantMarkdown.test.ts tests/farmToolUtils.test.ts tests/newsUtils.test.ts tests/storageUtils.test.ts tests/userIdentity.test.ts
+npm run build
+npm run lint
+```
+
+The frontend currently has no checked-in browser automation setup; browser-only keyboard, screen-reader, contrast, and deployed-origin checks remain manual.
+
 ## Demo credentials
 
 - Farmer: Ravi Kumar
@@ -120,8 +142,5 @@ If the assistant reports an invalid key, check that the root `.env` variable is 
 
 ## Future improvements
 
-- Connect to real weather, market, and storage APIs
-- Add user authentication and profiles
-- Add image-model integration for crop diagnosis
-- Add localization tightening and deeper translation coverage
+- Verify production provider connectivity and complete localization coverage
 - Add more robust monitoring, analytics, and export features

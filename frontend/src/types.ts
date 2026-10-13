@@ -200,6 +200,7 @@ export type ProfitData = {
 export type DashboardData = {
   farmer: Farmer;
   crop: Crop;
+  farmer_summary?: { crop_count: number; open_task_count: number; data_source: string } | null;
   weather: Weather[];
   market: Market[];
   notifications: NotificationItem[];

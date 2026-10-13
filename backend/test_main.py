@@ -1,4 +1,4 @@
-﻿import os
+import os
 import tempfile
 import unittest
 import asyncio
@@ -11,7 +11,7 @@ from fastapi import HTTPException, UploadFile
 from fastapi.testclient import TestClient
 from starlette.datastructures import Headers
 
-from backend import main
+from backend import main, local_agri_assistant
 
 
 class PersistenceRegressionTests(unittest.TestCase):
@@ -295,6 +295,37 @@ class MandiIntegrationTests(unittest.TestCase):
         self.assertEqual(record["converted_modal_price"], 21)
         self.assertTrue(record["price_compatible"])
 
+    def test_trend_excludes_unknown_units_and_invalid_dates(self):
+        today = main.date.today()
+        records = [
+            {"arrival_date": (today - main.timedelta(days=offset)).isoformat(), "modal_price": 10 + offset,
+             "price_unit": "Rs/kg"}
+            for offset in range(7)
+        ]
+        records.extend([
+            {"arrival_date": today.isoformat(), "modal_price": 999999, "price_unit": "per crate"},
+            {"arrival_date": "not-a-date", "modal_price": 888888, "price_unit": "Rs/kg"},
+        ])
+        with patch.object(main, "market_prices", new=AsyncMock(return_value={"records": records, "data_source": "Mandi Price API"})):
+            trend = asyncio.run(main.get_market_trend_data())
+        self.assertTrue(trend["trend_available"])
+        self.assertEqual(trend["price_unit"], "₹/kg")
+        self.assertEqual(len(trend["observations"]), 7)
+        self.assertNotIn(999999, [point["price"] for point in trend["observations"]])
+        self.assertNotIn(888888, [point["price"] for point in trend["observations"]])
+
+    def test_trend_with_no_valid_dated_compatible_prices_is_unavailable(self):
+        records = [
+            {"arrival_date": "not-a-date", "modal_price": 20, "price_unit": "Rs/kg"},
+            {"arrival_date": main.date.today().isoformat(), "modal_price": 2000, "price_unit": None},
+        ]
+        with patch.object(main, "market_prices", new=AsyncMock(return_value={"records": records, "data_source": "Mandi Price API"})):
+            trend = asyncio.run(main.get_market_trend_data())
+        self.assertFalse(trend["trend_available"])
+        self.assertFalse(trend["forecast_available"])
+        self.assertEqual(trend["observations"], [])
+        self.assertIsNone(trend["price_unit"])
+
     def test_profit_calculation_accepts_kg_inputs(self):
         payload = main.ProfitRequest(crop="Tomato", quantity=100, current_price=20,
             expected_selling_price=25, transport_cost=100, storage_cost=0,
@@ -404,6 +435,23 @@ class CropDoctorTests(unittest.TestCase):
                 asyncio.run(main.analyze_crop(images=[upload], crop="", location="", organs=["leaf"]))
         self.assertEqual(raised.exception.status_code, 504)
         self.assertIn("Pl@ntNet species identification failed", raised.exception.detail)
+
+    def test_plantnet_wrapped_connection_refusal_has_safe_actionable_message(self):
+        error = main.urllib.error.URLError(ConnectionRefusedError("private network detail"))
+        response = main.plantnet_error(error, "species identification")
+        self.assertEqual(response.status_code, 502)
+        self.assertIn("connection to Pl@ntNet was refused", response.detail)
+        self.assertIn("check outbound firewall rules", response.detail)
+        self.assertNotIn("private network detail", response.detail)
+
+    def test_plantnet_wrapped_tls_and_dns_errors_are_distinguished(self):
+        tls_error = main.urllib.error.URLError(main.ssl.SSLCertVerificationError("private certificate detail"))
+        dns_error = main.urllib.error.URLError(main.socket.gaierror("private resolver detail"))
+        tls_response = main.plantnet_error(tls_error, "species identification")
+        dns_response = main.plantnet_error(dns_error, "species identification")
+        self.assertIn("TLS certificate verification failed", tls_response.detail)
+        self.assertIn("hostname could not be resolved", dns_response.detail)
+        self.assertNotIn("private", tls_response.detail + dns_response.detail)
 
     def test_plantnet_uses_species_identification_and_maps_species_score(self):
         upload = UploadFile(filename="leaf.jpg", file=io.BytesIO(bytes((255, 216, 255, 1))), headers=Headers({"content-type": "image/jpeg"}))
@@ -777,6 +825,90 @@ class WeatherFailureTests(unittest.TestCase):
         self.assertIsNone(weather[0]["current_temperature"])
 
 
+class LocalAgriAssistantKnowledgeTests(unittest.TestCase):
+    def test_knowledge_base_covers_many_crops_and_intents(self):
+        stats = local_agri_assistant.knowledge_stats()
+        self.assertGreaterEqual(stats["crop_profiles"], 35)
+        self.assertGreaterEqual(stats["intent_entries"], 30)
+        self.assertGreaterEqual(stats["question_patterns"], 50)
+
+    def test_crop_and_topic_matrix_returns_relevant_distinct_answers(self):
+        checks = [
+            ("How should I water tomato plants?", "irrigation", "Tomato note"),
+            ("When are potatoes ready to harvest?", "harvest", "Potato note"),
+            ("How do I care for onions?", "cultivation", "Onion note"),
+            ("What care does okra need?", "cultivation", "Okra note"),
+            ("How do I grow brinjal?", "cultivation", "Brinjal note"),
+            ("How should I water mango trees?", "irrigation", "Mango note"),
+            ("When should I harvest banana?", "harvest", "Banana note"),
+            ("How do I grow papaya?", "cultivation", "Papaya note"),
+            ("How do I grow guava?", "cultivation", "Guava note"),
+            ("How do I grow citrus?", "cultivation", "Citrus note"),
+            ("How do I irrigate rice?", "irrigation", "Rice note"),
+            ("When should I sow wheat?", "seedling", "wheat"),
+            ("When do I harvest maize?", "harvest", "Maize note"),
+            ("How do I manage cotton pests safely?", "pest_management", "integrated pest management"),
+            ("How do I grow groundnut?", "cultivation", "Groundnut note"),
+        ]
+        answers = []
+        for question, expected_intent, expected_text in checks:
+            with self.subTest(question=question):
+                result = main.answer_local_agri_question(question)
+                self.assertEqual(result["intent"], expected_intent)
+                self.assertIn(expected_text.lower(), result["answer"].lower())
+                answers.append(result["answer"])
+        self.assertGreater(len(set(answers)), 10)
+
+    def test_soil_water_symptom_pest_harvest_rotation_and_local_advisory_topics(self):
+        checks = [
+            ("What does soil pH mean?", "soil_ph", "soil test"),
+            ("Could this be a nitrogen deficiency?", "nutrient_deficiency", "soil or plant test"),
+            ("Is overwatering harmful?", "overwatering", "waterlogged"),
+            ("What are signs of underwatering?", "underwatering", "dry soil"),
+            ("Why are my leaves turning yellow?", "yellowing", "not a diagnosis"),
+            ("My plants are wilting, what should I check?", "wilting", "soil moisture"),
+            ("How do I control crop pests safely?", "pest_management", "integrated pest management"),
+            ("What should I do after harvesting vegetables?", "harvest", "maturity"),
+            ("How can I store harvested crops?", "storage", "post-harvest"),
+            ("Why use crop rotation?", "rotation", "rotation"),
+            ("When is Kharif season?", "seasons", "Kharif"),
+            ("Why is my tomato fruit cracking?", "fruit_cracking", "moisture"),
+        ]
+        for question, expected_intent, expected_text in checks:
+            with self.subTest(question=question):
+                result = main.answer_local_agri_question(question)
+                self.assertEqual(result["intent"], expected_intent)
+                self.assertIn(expected_text.lower(), result["answer"].lower())
+
+    def test_farm_sample_market_weather_unknown_and_project_answers_are_truthful(self):
+        sample = main.answer_local_agri_question(
+            "What crops are in my farm records?",
+            shared_crops=[{"name": "Tomato"}, {"name": "Rice"}, {"name": "Cotton"}],
+        )
+        self.assertIn("not confirmed as your farm", sample["answer"])
+        self.assertIn("Tomato, Rice, Cotton", sample["answer"])
+        self.assertIn("SHARED SAMPLE DATA", sample["data_source"])
+
+        market = main.answer_local_agri_question("What is the current market price of tomato?")
+        weather = main.answer_local_agri_question("Will it rain today?")
+        unsupported = main.answer_local_agri_question("Can you explain quantum entanglement?")
+        judge = main.answer_local_agri_question("How does AgriSense answer without generative AI?")
+        self.assertEqual(market["intent"], "live_market")
+        self.assertIn("cannot verify live market prices", market["answer"])
+        self.assertEqual(weather["intent"], "live_weather")
+        self.assertIn("cannot verify current weather", weather["answer"])
+        self.assertEqual(unsupported["intent"], "general")
+        self.assertIn("do not have a reliable local rule", unsupported["answer"])
+        self.assertEqual(judge["intent"], "project")
+        self.assertIn("does not call Gemini, Groq, or a generative model", judge["answer"])
+
+    def test_normalization_and_common_crop_misspelling(self):
+        result = main.answer_local_agri_question("HOW do I water my manggo tree?!")
+        self.assertEqual(result["crop"], "mango")
+        self.assertEqual(result["intent"], "irrigation")
+        self.assertIn("Mango note:", result["answer"])
+
+
 class GeminiIntegrationTests(unittest.TestCase):
     def test_cors_allows_vite_fallback_port_only_on_loopback(self):
         client = TestClient(main.app)
@@ -841,107 +973,107 @@ class GeminiIntegrationTests(unittest.TestCase):
         self.assertEqual(request.call_count, 1)
         rate_limited.close()
 
-    def test_assistant_uses_low_thinking_for_shorter_response_latency(self):
-        captured = {}
+    def test_assistant_uses_local_rules_and_never_calls_external_providers(self):
+        def fake_fetch(query, params=()):
+            if "FROM crop" in query:
+                return [{"name": "Tomato"}, {"name": "Rice"}, {"name": "Cotton"}]
+            return []
 
-        def fake_request(url, headers, body):
-            captured["url"] = url
-            captured["payload"] = main.json.loads(body)
-            return {"candidates": [{"content": {"parts": [{"text": "General tomato guidance."}]}}]}
+        with patch.object(main, "get_secret", side_effect=AssertionError("Assistant must not read provider keys")), \
+             patch.object(main, "request_gemini_json") as gemini, \
+             patch.object(main, "external_json") as external, \
+             patch.object(main, "get_weather", new=AsyncMock(side_effect=AssertionError("Assistant must not fetch weather"))), \
+             patch.object(main, "get_market_rows", new=AsyncMock(side_effect=AssertionError("Assistant must not fetch market data"))), \
+             patch.object(main, "fetch_all", side_effect=fake_fetch):
+            response = TestClient(main.app).post("/api/assistant", json={"message": "How should I water tomatoes?", "crop": "Tomato", "location": "Bengaluru", "language": "en"})
 
-        decision = {"recommendation": "WAIT", "confidence": 0, "reasons": []}
-        with patch.object(main, "get_secret", return_value="configured-test-key"), \
-             patch.object(main, "score_to_decision", return_value=decision), \
-             patch.object(main, "fetch_all", return_value=[]), \
-             patch.object(main, "get_weather", return_value=[]), \
-             patch.object(main, "get_market_rows", return_value=[]), \
-             patch.object(main, "request_gemini_json", side_effect=fake_request):
-            asyncio.run(main.ask_assistant(main.AssistantRequest(message="How should I water tomatoes?")))
-
-        self.assertTrue(captured["url"].endswith("/v1beta/models/gemini-3.8-flash:generateContent"))
-        self.assertEqual(captured["payload"]["generationConfig"]["thinkingConfig"]["thinkingLevel"], "low")
-        self.assertEqual(captured["payload"]["generationConfig"]["maxOutputTokens"], 768)
-
-    def test_assistant_keeps_deterministic_decision_in_response(self):
-        decision = {"recommendation": "WAIT", "confidence": 0, "reasons": ["Market inputs are missing"]}
-        with patch.object(main, "get_secret", return_value="configured-test-key"), \
-             patch.object(main, "score_to_decision", return_value=decision), \
-             patch.object(main, "fetch_all", return_value=[]), \
-             patch.object(main, "get_weather", return_value=[]), \
-             patch.object(main, "get_market_rows", return_value=[]), \
-             patch.object(main, "request_gemini_json", return_value={"candidates": [{"content": {"parts": [{"text": "General tomato guidance."}]}}]}):
-            response = asyncio.run(main.ask_assistant(main.AssistantRequest(message="How should I water tomatoes?")))
-        self.assertEqual(response["recommendation"], "WAIT")
-        self.assertEqual(response["reasons"], ["Market inputs are missing"])
-        self.assertTrue(response["answer"].startswith("General tomato guidance."))
-
-    def test_assistant_does_not_call_gemini_when_key_is_missing(self):
-        with patch.object(main, "get_secret", return_value=""), \
-             patch.object(main, "score_to_decision", return_value={"recommendation": "WAIT", "confidence": 0, "reasons": []}), \
-             patch.object(main, "fetch_all", return_value=[]), \
-             patch.object(main, "get_weather", return_value=[]), \
-             patch.object(main, "get_market_rows", return_value=[]), \
-             patch.object(main, "request_gemini_json") as request:
-            response = asyncio.run(main.ask_assistant(main.AssistantRequest(message="How do I water tomatoes?")))
-        self.assertEqual(response["status"], "unavailable")
-        self.assertIn("GEMINI_API_KEY is not configured", response["answer"])
-        request.assert_not_called()
-
-    def test_malformed_gemini_response_returns_safe_error(self):
-        with patch.object(main, "get_secret", return_value="configured-test-key"), \
-             patch.object(main, "score_to_decision", return_value={"recommendation": "WAIT", "confidence": 0, "reasons": []}), \
-             patch.object(main, "fetch_all", return_value=[]), \
-             patch.object(main, "get_weather", return_value=[]), \
-             patch.object(main, "get_market_rows", return_value=[]), \
-             patch.object(main, "request_gemini_json", return_value={"candidates": []}):
-            with self.assertRaises(HTTPException) as raised:
-                asyncio.run(main.ask_assistant(main.AssistantRequest(message="How do I water tomatoes?")))
-        self.assertEqual(raised.exception.status_code, 502)
-        self.assertIn("unexpected response", raised.exception.detail)
-
-    def test_gemini_quota_error_is_sanitized_and_preserves_http_429(self):
-        quota_error = main.urllib.error.HTTPError(
-            "https://example.invalid", 429, "quota exhausted", {}, None
-        )
-        with patch.object(main, "get_secret", return_value="configured-test-key"), \
-             patch.object(main, "score_to_decision", return_value={"recommendation": "WAIT", "confidence": 0, "reasons": []}), \
-             patch.object(main, "fetch_all", return_value=[]), \
-             patch.object(main, "get_weather", return_value=[]), \
-             patch.object(main, "get_market_rows", return_value=[]), \
-             patch.object(main, "request_gemini_json", side_effect=quota_error):
-            response = TestClient(main.app).post(
-                "/api/assistant",
-                json={"message": "How should I water tomatoes?", "crop": "Tomato", "location": "Bengaluru", "language": "en"},
-            )
-        self.assertEqual(response.status_code, 429)
-        self.assertIn("rate limited", response.json()["detail"])
-        self.assertNotIn("configured-test-key", response.text)
-        quota_error.close()
-
-    def test_http_status_and_chat_routes_do_not_return_secret(self):
-        client = TestClient(main.app)
-        with patch.object(main, "get_secret", return_value="configured-test-key"):
-            status = client.get("/api/assistant/status")
-        self.assertEqual(status.status_code, 200)
-        self.assertTrue(status.json()["configured"])
-        self.assertNotIn("configured-test-key", status.text)
-
-        decision = {"recommendation": "WAIT", "confidence": 0, "reasons": ["Missing inputs"]}
-        with patch.object(main, "get_secret", return_value="configured-test-key"), \
-             patch.object(main, "score_to_decision", return_value=decision), \
-             patch.object(main, "fetch_all", return_value=[]), \
-             patch.object(main, "get_weather", new=AsyncMock(return_value=[])), \
-             patch.object(main, "get_market_rows", new=AsyncMock(return_value=[])), \
-             patch.object(main, "request_gemini_json", return_value={"candidates": [{"content": {"parts": [{"text": "Water tomatoes at the soil line."}]}}]}):
-            response = client.post("/api/assistant", json={"message": "How should I water tomatoes?", "crop": "Tomato", "location": "Bengaluru", "language": "en"})
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json()["recommendation"], "WAIT")
-        self.assertIn("Water tomatoes", response.json()["answer"])
-        self.assertNotIn("configured-test-key", response.text)
+        payload = response.json()
+        self.assertEqual(set(payload), {"answer", "recommendation", "confidence", "reasons", "data_source"})
+        self.assertIn("Tomato note:", payload["answer"])
+        self.assertIn("LOCAL RULE-BASED KNOWLEDGE", payload["data_source"])
+        gemini.assert_not_called()
+        external.assert_not_called()
 
-    def test_model_setting_is_read_from_backend_configuration(self):
-        with patch.object(main, "get_secret", return_value="gemini-3.8-flash"):
-            self.assertEqual(main.get_gemini_model(), "gemini-3.8-flash")
+    def test_assistant_answers_common_questions_locally_without_gemini_or_groq(self):
+        questions = [
+            ("How can I improve soil health on my farm?", "soil"),
+            ("How should I water tomatoes?", "Tomato"),
+            ("How do I care for mango trees?", "Mango"),
+            ("How should rice irrigation be managed?", "Rice"),
+            ("What is the current market price of tomato?", "cannot verify live market prices"),
+        ]
+        with patch.object(main, "get_secret", side_effect=AssertionError("Assistant must not read provider keys")), \
+             patch.object(main, "request_gemini_json") as gemini, \
+             patch.object(main, "external_json") as external, \
+             patch.object(main, "get_weather", new=AsyncMock(side_effect=AssertionError("Assistant must not fetch weather"))), \
+             patch.object(main, "get_market_rows", new=AsyncMock(side_effect=AssertionError("Assistant must not fetch live prices"))), \
+             patch.object(main, "fetch_all", return_value=[]):
+            client = TestClient(main.app)
+            responses = [client.post("/api/assistant", json={"message": question, "crop": "Tomato", "location": "Bengaluru", "language": "en"}) for question, _ in questions]
+
+        for (question, expected), response in zip(questions, responses):
+            with self.subTest(question=question):
+                self.assertEqual(response.status_code, 200)
+                self.assertIn(expected.lower(), response.json()["answer"].lower())
+                self.assertIn("LOCAL RULE-BASED KNOWLEDGE", response.json()["data_source"])
+        gemini.assert_not_called()
+        external.assert_not_called()
+
+    def test_local_assistant_status_is_available_without_provider_keys(self):
+        with patch.object(main, "get_secret", side_effect=AssertionError("Status must not inspect provider keys")):
+            response = TestClient(main.app).get("/api/assistant/status")
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.json()["available"])
+        self.assertEqual(response.json()["status"], "local")
+        self.assertEqual(response.json()["label"], "LOCAL AGRICULTURE ASSISTANT")
+        self.assertNotIn("model", response.json())
+        self.assertNotIn("configured", response.json())
+
+    def test_account_records_are_scoped_and_shared_crop_rows_are_not_treated_as_owned(self):
+        queries = []
+        def fake_fetch(query, params=()):
+            queries.append((query, params))
+            if "FROM farm_tool_record" in query:
+                return [{"kind": "planner-crops", "payload": main.json.dumps({"crop": "Mango", "stage": "Flowering", "planting_date": "2026-06-01"}), "created_at": "2026-06-01", "updated_at": "2026-06-01"}]
+            return []
+
+        with patch.object(main, "get_secret", side_effect=AssertionError("Assistant must not read provider keys")), \
+             patch.object(main, "_authenticated_user", return_value={"id": 27}), \
+             patch.object(main, "fetch_all", side_effect=fake_fetch), \
+             patch.object(main, "request_gemini_json") as gemini, \
+             patch.object(main, "external_json") as external:
+            response = TestClient(main.app).post("/api/assistant", headers={"Authorization": "Bearer test-session-token"}, json={"message": "What do my farm records show about mango?", "crop": "Tomato", "location": "Bengaluru", "language": "en"})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("Flowering", response.json()["answer"])
+        self.assertIn("USER ENTERED FARM RECORDS", response.json()["data_source"])
+        self.assertEqual(next(params for query, params in queries if "FROM farm_tool_record" in query), (27,))
+        gemini.assert_not_called()
+        external.assert_not_called()
+
+    def test_current_data_and_unknown_questions_are_honest(self):
+        market = main.answer_local_agri_question("What is the current market price of tomato?")
+        weather = main.answer_local_agri_question("Will it rain today?")
+        unsupported = main.answer_local_agri_question("Can you explain quantum entanglement?")
+        self.assertIn("cannot verify live market prices", market["answer"])
+        self.assertIn("cannot verify current weather", weather["answer"])
+        self.assertIn("do not have a reliable local rule", unsupported["answer"])
+
+    def test_assistant_ignores_gemini_configuration_and_does_not_call_a_provider(self):
+        client = TestClient(main.app)
+        with patch.object(main, "get_secret", side_effect=AssertionError("Assistant must not read provider configuration")), \
+             patch.object(main, "fetch_all", return_value=[]), \
+             patch.object(main, "request_gemini_json") as request, \
+             patch.object(main, "external_json") as external:
+            status = client.get("/api/assistant/status")
+            response = client.post("/api/assistant", json={"message": "Question", "crop": "Tomato", "location": "Bengaluru", "language": "en"})
+        self.assertEqual(status.json()["status"], "local")
+        self.assertEqual(status.json()["label"], "LOCAL AGRICULTURE ASSISTANT")
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("LOCAL RULE-BASED KNOWLEDGE", response.json()["data_source"])
+        request.assert_not_called()
+        external.assert_not_called()
 
 
 class FarmToolsApiTests(unittest.TestCase):
@@ -1001,6 +1133,84 @@ class FarmToolsApiTests(unittest.TestCase):
         self.assertEqual(task.status_code, 422)
         with self.assertRaises(HTTPException):
             main._farm_tool_validate("profit", {"crop": "Tomato", "scenario": "NaN", "quantity": 2, "unit": "kg", "price": float("nan"), "price_unit": "kg"})
+
+    def test_authenticated_dashboard_metrics_refresh_from_owned_farm_records(self):
+        first, second = self.accounts
+        providers = (
+            patch.object(main, "get_weather", new=AsyncMock(return_value=[])),
+            patch.object(main, "get_market_rows", new=AsyncMock(return_value=[])),
+            patch.object(main, "get_market_trend_data", new=AsyncMock(return_value={"trend_available": False, "forecast_available": False, "observations": []})),
+            patch.object(main, "get_storage", new=AsyncMock(return_value=[])),
+        )
+        for provider in providers:
+            provider.start()
+        try:
+            initial = self.client.get("/api/dashboard", headers=first["headers"]).json()["farmer_summary"]
+            self.assertEqual(initial, {"crop_count": 0, "open_task_count": 0, "data_source": "USER ENTERED"})
+            crop = self.client.post("/api/farm-tools/planner-crops", headers=first["headers"], json={"data": {"crop": "Tomato", "planting_date": "2026-01-01", "area": 1, "stage": "Seedling", "harvest_date": ""}})
+            self.assertEqual(crop.status_code, 201)
+            task = self.client.post("/api/farm-tools/planner-tasks", headers=first["headers"], json={"data": {"title": "Water", "crop": "Tomato", "description": "", "date": "2026-01-02", "priority": "Medium", "status": "Pending"}})
+            refreshed = self.client.get("/api/dashboard", headers=first["headers"]).json()["farmer_summary"]
+            self.assertEqual(refreshed["crop_count"], 1)
+            self.assertEqual(refreshed["open_task_count"], 1)
+            self.assertEqual(self.client.get("/api/dashboard", headers=second["headers"]).json()["farmer_summary"]["crop_count"], 0)
+            self.client.put(f"/api/farm-tools/planner-tasks/{task.json()['id']}", headers=first["headers"], json={"data": {"title": "Water", "crop": "Tomato", "description": "", "date": "2026-01-02", "priority": "Medium", "status": "Completed"}})
+            updated = self.client.get("/api/dashboard", headers=first["headers"]).json()["farmer_summary"]
+            self.assertEqual(updated["open_task_count"], 0)
+        finally:
+            for provider in reversed(providers):
+                provider.stop()
+
+
+class NotificationReadReceiptTests(unittest.TestCase):
+    def setUp(self):
+        self.temp_directory = tempfile.TemporaryDirectory(dir=os.path.dirname(__file__))
+        self.db_path = os.path.join(self.temp_directory.name, "notifications.db")
+        self.db_patch = patch.object(main, "DB_PATH", self.db_path)
+        self.db_patch.start()
+        main.init_db()
+        self.client = TestClient(main.app)
+        with main._auth_rate_limit_lock:
+            main._auth_attempts.clear()
+
+    def tearDown(self):
+        self.client.close()
+        self.db_patch.stop()
+        self.temp_directory.cleanup()
+        with main._auth_rate_limit_lock:
+            main._auth_attempts.clear()
+
+    def _signup(self, name, email):
+        response = self.client.post("/api/auth/signup", json={
+            "name": name,
+            "email": email,
+            "password": "StrongPass123!",
+        })
+        self.assertEqual(response.status_code, 201)
+        return {"Authorization": f"Bearer {response.json()['access_token']}"}
+
+    def test_marking_demo_notification_read_requires_auth_and_is_per_account(self):
+        notification_id = 4
+        self.assertEqual(self.client.put(f"/api/notifications/{notification_id}/read").status_code, 401)
+
+        first = self._signup("First Farmer", "first@example.test")
+        second = self._signup("Second Farmer", "second@example.test")
+        initial_first = self.client.get("/api/notifications", headers=first).json()
+        initial_second = self.client.get("/api/notifications", headers=second).json()
+        self.assertFalse(next(item["read"] for item in initial_first if item["id"] == notification_id))
+        self.assertFalse(next(item["read"] for item in initial_second if item["id"] == notification_id))
+
+        marked = self.client.put(f"/api/notifications/{notification_id}/read", headers=first)
+        self.assertEqual(marked.status_code, 200)
+        first_after = self.client.get("/api/notifications", headers=first).json()
+        second_after = self.client.get("/api/notifications", headers=second).json()
+        anonymous_after = self.client.get("/api/notifications").json()
+        self.assertTrue(next(item["read"] for item in first_after if item["id"] == notification_id))
+        self.assertFalse(next(item["read"] for item in second_after if item["id"] == notification_id))
+        self.assertFalse(next(item["read"] for item in anonymous_after if item["id"] == notification_id))
+        with closing(main.sqlite3.connect(self.db_path)) as connection:
+            seed_read = connection.execute("SELECT read FROM notification WHERE id = ?", (notification_id,)).fetchone()[0]
+        self.assertEqual(seed_read, 0)
 
 
 if __name__ == "__main__":

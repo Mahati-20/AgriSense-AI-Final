@@ -2,9 +2,10 @@ import type { CalendarTask, DashboardData, DecisionPayload, Market, MandiOptions
 
 // Match the backend's loopback IPv4 address. `localhost` can resolve to ::1
 // while Uvicorn is bound only to 127.0.0.1 on some Windows setups.
-const API_URL = import.meta.env.VITE_API_URL || 'http://127.0.0.1:8000';
+const API_URL = import.meta.env.VITE_API_URL || (import.meta.env.DEV ? 'http://127.0.0.1:8000' : '');
 
 async function fetchJson<T>(path: string, options?: RequestInit, onRequestStarted?: () => void): Promise<T> {
+  if (!API_URL) throw new Error('The production API URL is missing. Set VITE_API_URL to the deployed backend origin and rebuild the frontend.');
   const token = sessionStorage.getItem('agrisense_session');
   const request = fetch(`${API_URL}${path}`, {
     ...options,
@@ -63,7 +64,7 @@ export async function screenCropDisease(files: File[], organ = 'leaf', signal?: 
 export const calculateProfit = (payload: unknown) => fetchJson<ProfitData>('/api/profit/calculate', { method: 'POST', body: JSON.stringify(payload) });
 export const getDecision = (payload: DecisionPayload) => fetchJson<any>('/api/decision/analyze', { method: 'POST', body: JSON.stringify(payload) });
 export const askAssistant = (payload: { message: string; crop: string; location: string; language: string }) => fetchJson<any>('/api/assistant', { method: 'POST', body: JSON.stringify(payload) });
-export const getAssistantStatus = () => fetchJson<{ available: boolean; status: string; model: string; data_source: string }>('/api/assistant/status');
+export const getAssistantStatus = () => fetchJson<{ available: boolean; status: string; label: string; data_source: string }>('/api/assistant/status');
 export const getCalendar = () => fetchJson<CalendarTask[]>('/api/calendar');
 export type NewsSearchFilters = { lang?: string; country?: string; sortBy?: 'publishedAt' | 'relevance' };
 export const getNews = (q: string, filters: NewsSearchFilters = {}) => {

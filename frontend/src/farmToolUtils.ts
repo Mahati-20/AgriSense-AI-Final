@@ -11,9 +11,24 @@ export function convertAgriculturalUnit(value: number, from: string, to: string)
   return multiplier === undefined ? null : value * multiplier;
 }
 
+export function escapeCsvCell(value: unknown): string {
+  const text = String(value ?? '');
+  const safeText = /^\s*[=+@-]/.test(text) ? `'${text}` : text;
+  return `"${safeText.replaceAll('"', '""')}"`;
+}
+
 export function currentDateKey(): string {
   const now = new Date();
   return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
+}
+
+export function isValidDateKey(value: string): boolean {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) return false;
+  const [year, month, day] = value.split('-').map(Number);
+  const parsed = new Date(Date.UTC(year, month - 1, day));
+  return parsed.getUTCFullYear() === year
+    && parsed.getUTCMonth() === month - 1
+    && parsed.getUTCDate() === day;
 }
 
 export function monthCalendarDays(monthKey: string): string[] {

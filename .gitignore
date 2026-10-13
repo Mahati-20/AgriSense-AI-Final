@@ -14,10 +14,15 @@ __pycache__/
 *.py[cod]
 venv/
 env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage*
 
 # Frontend
 node_modules/
 dist/
+.vite/
 
 # Local databases and backups
 *.sqlite
@@ -32,3 +37,5 @@ backend/tmp*/
 *.db
 *.sqlite
 *.sqlite3
+*.db-wal
+*.db-shm

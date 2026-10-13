@@ -61,9 +61,11 @@ import {
 } from './services/api';
 import type { CalendarTask, DashboardData, MandiPricesResponse, NewsItem, StorageItem, Weather } from './types';
 import { filterAndSortStorage, storageListState } from './storageUtils.ts';
+import { isValidDateKey } from './farmToolUtils.ts';
 import { shouldSubmitAssistantOnEnter } from './assistantKeyboard.ts';
 import { AssistantErrorMessage, AssistantMarkdown } from './assistantMarkdown.ts';
 import { authenticatedDisplayName } from './userIdentity.ts';
+import { newsResultsState, presentNewsArticle } from './newsUtils.ts';
 import { getTranslation, type LanguageCode } from './i18n';
 import { FarmToolPage, FarmToolsSection } from './FarmTools';
 
@@ -120,7 +122,7 @@ function App() {
             <Route path="calendar" element={<LoginRequired><CalendarPage language={language} /></LoginRequired>} />
             <Route path="news" element={<NewsPage language={language} />} />
             <Route path="assistant" element={<AssistantPage language={language} />} />
-            <Route path="notifications" element={<NotificationsPage language={language} />} />
+            <Route path="notifications" element={<NotificationsPage language={language} user={user} />} />
             <Route path="planner" element={<LoginRequired><FarmToolPage key="planner" /></LoginRequired>} />
             <Route path="profit-loss" element={<LoginRequired><FarmToolPage key="profit-loss" /></LoginRequired>} />
             <Route path="crop-journal" element={<LoginRequired><FarmToolPage key="crop-journal" /></LoginRequired>} />
@@ -261,10 +263,15 @@ function DashboardPage({ language, user }: { language: LanguageCode; user: { nam
   if (!dashboard) return <div className="page-shell"><div className="card metric-card"><p role="alert">{error}</p><button className="primary-btn" onClick={load}>Retry</button></div></div>;
 
   const weatherToday = dashboard.weather[0];
+  const farmerMetrics = dashboard.farmer_summary;
   const metrics = [
     { label: 'Weather', value: weatherToday.current_temperature == null ? '—' : `${weatherToday.current_temperature}°C`, icon: Sun },
-    { label: 'Crop stage · DEMO', value: dashboard.crop.current_stage, icon: Leaf },
-    { label: 'Farm size · DEMO', value: `${dashboard.farmer.farm_size} acres`, icon: MapPin },
+    farmerMetrics
+      ? { label: 'Your crops · USER ENTERED', value: String(farmerMetrics.crop_count), icon: Leaf }
+      : { label: 'Crop stage · DEMO', value: dashboard.crop.current_stage, icon: Leaf },
+    farmerMetrics
+      ? { label: 'Open farm tasks · USER ENTERED', value: String(farmerMetrics.open_task_count), icon: MapPin }
+      : { label: 'Farm size · DEMO', value: `${dashboard.farmer.farm_size} acres`, icon: MapPin },
     { label: 'Market', value: dashboard.market[0]?.price_compatible && dashboard.market[0].price != null ? `₹${dashboard.market[0].price}/${dashboard.market[0].unit}` : dashboard.market[0]?.source_price == null ? '—' : `₹${dashboard.market[0].source_price} (unit unspecified)`, icon: ShoppingCart },
   ];
 
@@ -522,8 +529,8 @@ function MarketPage({ language }: { language: LanguageCode }) {
           <div className="muted">{prices?.unit_status}</div>
           {trendError && <p className="muted" role="alert">Historical trend unavailable: {trendError}</p>}
           {!trend?.trend_available && <div className="muted">{trend?.message ?? 'Insufficient dated records for a trend estimate.'}</div>}
-          {trend?.forecast_available && <div className="muted">Estimated future source-price range: {formatPrice(trend.forecast_range.lower)}–{formatPrice(trend.forecast_range.upper)} · {trend.forecast_method} · unit not specified by provider</div>}
-          {chartData.length > 0 && <div style={{ height: 260 }}><ResponsiveContainer width="100%" height="100%"><LineChart data={chartData}><CartesianGrid strokeDasharray="3 3" stroke="var(--line)" /><XAxis dataKey="date" tick={{ fontSize: 12 }} /><YAxis tick={{ fontSize: 12 }} /><Tooltip /><Line type="monotone" dataKey="price" name="Source modal price (unit unspecified)" stroke="var(--agri-gold)" strokeWidth={3} dot={{ r: 4 }} /></LineChart></ResponsiveContainer></div>}
+          {trend?.forecast_available && <div className="muted">Estimated future price range: {formatPrice(trend.forecast_range.lower)}–{formatPrice(trend.forecast_range.upper)} {trend.price_unit ? `(${trend.price_unit})` : '(unit unavailable)'} · {trend.forecast_method}{trend.freshness === 'stale' ? ` · ${trend.freshness_message} Estimate uses stale source records.` : ''}</div>}
+          {chartData.length > 0 && <div style={{ height: 260 }}><ResponsiveContainer width="100%" height="100%"><LineChart data={chartData}><CartesianGrid strokeDasharray="3 3" stroke="var(--line)" /><XAxis dataKey="date" tick={{ fontSize: 12 }} /><YAxis tick={{ fontSize: 12 }} /><Tooltip /><Line type="monotone" dataKey="price" name={`Confirmed mandi price (${trend?.price_unit ?? 'unit unavailable'})`} stroke="var(--agri-gold)" strokeWidth={3} dot={{ r: 4 }} /></LineChart></ResponsiveContainer></div>}
           <div className="market-records-scroll"><table className="market-record-table"><caption>{rows.length} source records · original values are preserved; conversion appears only where the provider supplies a recognized unit</caption><thead><tr><th>Arrival date</th><th>State</th><th>District</th><th>Market</th><th>Commodity / variety</th><th>Source unit</th><th>Min source price</th><th>Max source price</th><th>Modal source price</th><th>Converted modal (₹/kg when confirmed)</th><th>Source update</th></tr></thead><tbody>{rows.map((row, index) => <tr key={row.id ?? `${row.market}-${row.arrival_date}-${index}`}><td>{row.arrival_date || 'Not reported'}</td><td>{row.state || state}</td><td>{row.district || 'Not reported'}</td><td>{row.market || 'Not reported'}</td><td>{row.commodity || commodity}{row.variety ? ` · ${row.variety}` : ''}{row.grade ? ` · ${row.grade}` : ''}</td><td>{row.source_price_unit || 'Not provided by API'}</td><td>{formatPrice(row.min_price)}</td><td>{formatPrice(row.max_price)}</td><td>{formatPrice(row.modal_price)}</td><td>{row.converted_modal_price == null ? 'Not converted' : formatPrice(row.converted_modal_price)}{row.price_compatible && row.converted_modal_price != null && <button type="button" className="ghost-btn" onClick={() => { setCurrentPrice(Number(row.converted_modal_price)); setCurrentPriceSource(`Mandi Price API · ${row.source_price_unit}`); }}>Use in calculator</button>}</td><td>{row.fetched_at || 'Not provided'}</td></tr>)}</tbody></table></div>
         </>}
       </div>
@@ -848,8 +855,7 @@ function CalendarPage({ language }: { language: LanguageCode }) {
   }, []);
 
   const handleAddTask = async () => {
-    const parsedDate = new Date(`${newTask.date}T00:00:00`);
-    if (!newTask.title.trim() || !newTask.crop.trim() || !/^\d{4}-\d{2}-\d{2}$/.test(newTask.date) || Number.isNaN(parsedDate.getTime()) || parsedDate.toISOString().slice(0, 10) !== newTask.date) { setError('Enter a task title, crop, and valid date.'); return; }
+    if (!newTask.title.trim() || !newTask.crop.trim() || !isValidDateKey(newTask.date)) { setError('Enter a task title, crop, and valid date.'); return; }
     setError('');
     setSaving(true);
     try {
@@ -949,6 +955,7 @@ function NewsPage({ language }: { language: LanguageCode }) {
   };
   const retrySearch = () => { if (lastSearch) void loadNews(lastSearch.query, lastSearch); };
   const suggestedSearches = ['agriculture India', 'crop disease', 'monsoon farming', 'wheat prices', 'irrigation', 'organic farming'];
+  const resultState = newsResultsState({ loading, error, hasSearched, articleCount: news.length });
 
   return (
     <div className="page-shell agri-news-page">
@@ -988,11 +995,11 @@ function NewsPage({ language }: { language: LanguageCode }) {
 
       {error && <div className="news-error" role="alert"><div><strong>Search could not be completed</strong><p>{error}</p>{news.length > 0 && <span>Previous results for “{resultQuery}” are still shown below.</span>}</div>{lastSearch && <button className="secondary-btn" type="button" onClick={retrySearch} disabled={loading}>Retry search</button>}</div>}
 
-      {loading && <div className="news-results-grid" aria-live="polite" aria-busy="true">{[0, 1, 2].map((item) => <div className="news-card news-card-skeleton" key={item}><div className="skeleton news-skeleton-image" /><div className="skeleton" /><div className="skeleton" /><div className="skeleton" /></div>)}</div>}
+      {resultState === 'loading' && <div className="news-results-grid" aria-live="polite" aria-busy="true">{[0, 1, 2].map((item) => <div className="news-card news-card-skeleton" key={item}><div className="skeleton news-skeleton-image" /><div className="skeleton" /><div className="skeleton" /><div className="skeleton" /></div>)}</div>}
 
-      {!loading && !hasSearched && <section className="news-intro-empty"><div className="news-intro-icon"><Search size={24} /></div><h3>Search the latest agriculture coverage</h3><p>Enter a topic or choose a suggested search to get started.</p></section>}
+      {resultState === 'prompt' && <section className="news-intro-empty"><div className="news-intro-icon"><Search size={24} /></div><h3>Search the latest agriculture coverage</h3><p>Enter a topic or choose a suggested search to get started.</p></section>}
 
-      {!loading && hasSearched && !error && news.length === 0 && <section className="news-intro-empty"><div className="news-intro-icon"><Newspaper size={24} /></div><h3>No matching articles found</h3><p>Try broader keywords, another language, or remove the country filter.</p><div className="news-suggestions">{suggestedSearches.slice(0, 3).map((suggestion) => <button type="button" key={suggestion} onClick={() => { setQuery(suggestion); void loadNews(suggestion, { lang: languageFilter, country, sortBy }); }}>{suggestion}</button>)}</div></section>}
+      {resultState === 'empty' && <section className="news-intro-empty"><div className="news-intro-icon"><Newspaper size={24} /></div><h3>No matching articles found</h3><p>Try broader keywords, another language, or remove the country filter.</p><div className="news-suggestions">{suggestedSearches.slice(0, 3).map((suggestion) => <button type="button" key={suggestion} onClick={() => { setQuery(suggestion); void loadNews(suggestion, { lang: languageFilter, country, sortBy }); }}>{suggestion}</button>)}</div></section>}
 
       {news.length > 0 && <section className="news-results-section" aria-live="polite">
         <div className="news-results-heading"><div><span className="news-eyebrow">SEARCH RESULTS</span><h3>{news.length} {news.length === 1 ? 'article' : 'articles'} for “{resultQuery}”</h3></div><span className="news-provider-label"><span className="news-live-dot" /> GNews results</span></div>
@@ -1004,17 +1011,14 @@ function NewsPage({ language }: { language: LanguageCode }) {
 
 function NewsArticleCard({ item }: { item: NewsItem }) {
   const [imageFailed, setImageFailed] = useState(false);
-  const articleDate = item.date ? new Date(item.date) : null;
-  const dateLabel = articleDate && !Number.isNaN(articleDate.getTime())
-    ? new Intl.DateTimeFormat(undefined, { dateStyle: 'medium', timeStyle: 'short' }).format(articleDate)
-    : item.date;
+  const view = presentNewsArticle(item);
   return <article className="news-card">
-    {item.image && !imageFailed ? <img className="news-card-image" src={item.image} alt="" loading="lazy" onError={() => setImageFailed(true)} /> : <div className="news-card-image news-card-image-empty" aria-hidden="true"><Newspaper size={30} /></div>}
+    {view.imageUrl && !imageFailed ? <img className="news-card-image" src={view.imageUrl} alt="" loading="lazy" onError={() => setImageFailed(true)} /> : <div className="news-card-image news-card-image-empty" aria-hidden="true"><Newspaper size={30} /></div>}
     <div className="news-card-content">
-      <div className="news-card-meta"><span>{item.source || 'News source unavailable'}</span>{dateLabel && <time dateTime={item.date || undefined}>{dateLabel}</time>}</div>
-      <h4>{item.headline || 'Article title unavailable'}</h4>
-      {item.summary && <p>{item.summary}</p>}
-      {item.url && <a className="news-read-link" href={item.url} target="_blank" rel="noopener noreferrer">Read full article <ArrowUpRight size={16} /></a>}
+      <div className="news-card-meta"><span>{view.source}</span>{view.dateLabel && <time dateTime={item.date || undefined}>{view.dateLabel}</time>}</div>
+      <h4>{view.headline}</h4>
+      {view.summary && <p>{view.summary}</p>}
+      {view.articleUrl && <a className="news-read-link" href={view.articleUrl} target="_blank" rel="noopener noreferrer">Read full article <ArrowUpRight size={16} /></a>}
     </div>
   </article>;
 }
@@ -1222,15 +1226,15 @@ function AnalysisProgress({ step, labels }: { step: number; labels: string[] }) 
 function AssistantPage({ language }: { language: LanguageCode }) {
   const [input, setInput] = useState('');
   const [messages, setMessages] = useState<Array<{ role: 'user' | 'assistant'; text: string }>>([
-    { role: 'assistant', text: 'I can help you decide based on crop health, weather and market conditions.' },
+    { role: 'assistant', text: 'Ask me about crops, fruits, vegetables, soil, water, pests, harvest, or general farming. I can use your saved farm records when signed in. For current weather and market prices, check those features for live information.' },
   ]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   const [retryQuestion, setRetryQuestion] = useState('');
   const chatEndRef = useRef<HTMLDivElement>(null);
-  const [assistantStatus, setAssistantStatus] = useState<{ available: boolean; model: string; data_source: string } | null>(null);
+  const [assistantStatus, setAssistantStatus] = useState<{ available: boolean; status: string; label: string; data_source: string } | null>(null);
 
-  useEffect(() => { getAssistantStatus().then(setAssistantStatus).catch(() => setAssistantStatus({ available: false, model: 'unknown', data_source: 'DEMO / STATUS UNAVAILABLE' })); }, []);
+  useEffect(() => { getAssistantStatus().then(setAssistantStatus).catch(() => setAssistantStatus({ available: true, status: 'local', label: 'LOCAL AGRICULTURE ASSISTANT', data_source: 'Local agriculture knowledge' })); }, []);
   useEffect(() => { chatEndRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' }); }, [messages, loading]);
 
   const sendQuestion = async (question: string, addUserMessage: boolean) => {
@@ -1256,15 +1260,15 @@ function AssistantPage({ language }: { language: LanguageCode }) {
     <div className="page-shell assistant-page">
       <div className="card metric-card assistant-panel">
         <h3 className="section-title">{translate(language, 'assistant.title')}</h3>
-        {assistantStatus && <p className="demo-pill">{assistantStatus.available ? `AI CONFIGURED · ${assistantStatus.model}` : `DEMO / AI UNAVAILABLE · ${assistantStatus.data_source}`}</p>}
-        <p className="muted">Responses use available AgriSense data. Missing prices, weather, or diagnosis details are not inferred.</p>
+        {assistantStatus && <p className="demo-pill">{assistantStatus.label}</p>}
+        <p className="muted">Local answers use curated farming knowledge and your saved farm records. Live weather and prices are not verified here, and symptoms are not a confirmed diagnosis.</p>
         <div className="assistant-chat" role="log" aria-label="Assistant conversation" aria-live="polite">
           {messages.map((message, index) => (
             <div key={index} className={`chat-bubble ${message.role}`}>
               {message.role === 'assistant' ? <AssistantMarkdown content={message.text} /> : message.text}
             </div>
           ))}
-          {loading && <div className="chat-bubble ai">Analyzing farm data...</div>}
+          {loading && <div className="chat-bubble ai">Preparing a local answer...</div>}
           <div ref={chatEndRef} aria-hidden="true" />
         </div>
         {error && <div role="alert" className="muted"><AssistantErrorMessage message={error} /> <button className="ghost-btn" onClick={retry} disabled={loading || !retryQuestion}>Retry</button></div>}
@@ -1280,7 +1284,7 @@ function AssistantPage({ language }: { language: LanguageCode }) {
   );
 }
 
-function NotificationsPage({ language }: { language: LanguageCode }) {
+function NotificationsPage({ language, user }: { language: LanguageCode; user: { id: number; name: string; email: string } | null }) {
   const [items, setItems] = useState<Array<{ id: number; title: string; message: string; severity: string; timestamp: string; read: boolean; data_source?: string }>>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
@@ -1294,7 +1298,8 @@ function NotificationsPage({ language }: { language: LanguageCode }) {
     {loading ? <LoadingSkeleton /> : error ? <p role="alert">{error} <button className="primary-btn" onClick={load}>Retry</button></p> : items.length ? items.map((item) => <div className="notification-item" key={item.id}>
       <div className="notification-top"><strong>{item.title}</strong><span className={`pill ${item.read ? 'low' : 'high'}`}>{item.read ? 'Read' : 'Unread'}</span></div>
       <div>{item.message}</div><div className="muted">{item.timestamp} · {item.data_source ?? 'DEMO DATA'}</div>
-      {!item.read && <button className="ghost-btn" onClick={() => markRead(item.id)}>Mark as read</button>}
+      {!item.read && user && <button className="ghost-btn" onClick={() => markRead(item.id)}>Mark as read</button>}
+      {!item.read && !user && <Link className="ghost-btn" to="/login" state={{ from: '/dashboard/notifications' }}>Log in to mark as read</Link>}
     </div>) : <EmptyState message="No notifications." />}
   </div></div>;
 }
